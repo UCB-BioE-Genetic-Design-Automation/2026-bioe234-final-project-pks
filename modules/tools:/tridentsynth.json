@@ -139,7 +139,7 @@
   ],
   "execution_details": {
     "language": "Python",
-    "source": "tools/tridentsynth.py",
+    "source": "modules/tools/tridentsynth.py",
     "initialization": "initiate",
     "execution": "run",
     "disposal": null,
