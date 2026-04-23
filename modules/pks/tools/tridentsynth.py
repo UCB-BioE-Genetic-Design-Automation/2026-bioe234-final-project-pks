@@ -270,23 +270,31 @@ class TridentSynth:
 
     def _default_payload_items(self, form: Tag) -> list[tuple[str, str]]:
         items: list[tuple[str, str]] = []
-        for tag in form.find_all(["input", "select", "textarea"]):
+
+        for tag in form.find_all(["input", "textarea", "select"]):
             name = tag.get("name")
             if not name:
                 continue
 
             if tag.name == "input":
                 field_type = tag.get("type", "text").lower()
+
+                # Keep hidden fields like tokens / backend metadata.
                 if field_type == "hidden":
                     items.append((name, tag.get("value", "")))
-                elif field_type in {"checkbox", "radio"} and tag.has_attr("checked"):
-                    items.append((name, tag.get("value", "on")))
-                elif field_type not in {"submit", "button", "file", "image"} and tag.get("value"):
+
+                # Keep plain text-like defaults if the site expects them.
+                elif field_type in {"text", "search", "number"} and tag.get("value"):
                     items.append((name, tag.get("value", "")))
 
+                # Skip checkbox/radio defaults so we do NOT accidentally submit
+                # pks/bio/chem selections the user did not ask for.
+                elif field_type in {"checkbox", "radio"}:
+                    continue
+
             elif tag.name == "textarea":
-                if tag.text:
-                    items.append((name, tag.text))
+                if tag.text and tag.text.strip():
+                    items.append((name, tag.text.strip()))
 
             elif tag.name == "select":
                 selected = tag.find("option", selected=True)
@@ -389,7 +397,24 @@ class TridentSynth:
         else:
             response = session.post(url, data=items, timeout=120)
 
-        response.raise_for_status()
+        if not response.ok:
+            payload_preview = {}
+            for k, v in items:
+                if k in payload_preview:
+                    if isinstance(payload_preview[k], list):
+                        payload_preview[k].append(v)
+                    else:
+                        payload_preview[k] = [payload_preview[k], v]
+                else:
+                    payload_preview[k] = v
+
+            body_excerpt = response.text[:2000] if response.text else ""
+            raise RuntimeError(
+                f"TridentSynth submission failed with HTTP {response.status_code} for {url}\n"
+                f"Payload preview: {payload_preview}\n"
+                f"Response body excerpt:\n{body_excerpt}"
+            )
+
         return response
 
     def _handle_controlled_substance_warning(
