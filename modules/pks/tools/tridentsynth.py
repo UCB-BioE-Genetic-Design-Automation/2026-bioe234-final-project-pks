@@ -268,6 +268,45 @@ class TridentSynth:
                 best_score = score
         return best
 
+    def _find_strategy_field(self, fields: list[_FieldCandidate], key: str) -> Optional[_FieldCandidate]:
+        key = key.lower()
+        candidates: list[tuple[int, _FieldCandidate]] = []
+
+        for field in fields:
+            if field.field_type not in {"checkbox", "radio"}:
+                continue
+
+            name = (field.name or "").strip().lower()
+            value = (field.value or "").strip().lower()
+            context = field.context or ""
+
+            score = 0
+
+            if name == f"synthesisstrategy_{key}":
+                score += 100
+            if name == f"synthesis_strategy_{key}":
+                score += 95
+            if name.endswith(f"_{key}"):
+                score += 80
+            if name == key:
+                score += 60
+
+            if value == key:
+                score += 20
+            if re.search(rf"\b{re.escape(key)}\b", context):
+                score += 10
+            if "strategy" in context or "synthesis" in context:
+                score += 5
+
+            if score > 0:
+                candidates.append((score, field))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
     def _default_payload_items(self, form: Tag) -> list[tuple[str, str]]:
         items: list[tuple[str, str]] = []
 
@@ -279,16 +318,10 @@ class TridentSynth:
             if tag.name == "input":
                 field_type = tag.get("type", "text").lower()
 
-                # Keep hidden fields like tokens / backend metadata.
                 if field_type == "hidden":
                     items.append((name, tag.get("value", "")))
-
-                # Keep plain text-like defaults if the site expects them.
                 elif field_type in {"text", "search", "number"} and tag.get("value"):
                     items.append((name, tag.get("value", "")))
-
-                # Skip checkbox/radio defaults so we do NOT accidentally submit
-                # pks/bio/chem selections the user did not ask for.
                 elif field_type in {"checkbox", "radio"}:
                     continue
 
@@ -319,14 +352,25 @@ class TridentSynth:
         use_chem: bool,
     ) -> dict[str, str]:
         chosen: dict[str, str] = {}
+        used_field_names: set[str] = set()
+
         for enabled, key in [(use_pks, "pks"), (use_bio, "bio"), (use_chem, "chem")]:
             if not enabled:
                 continue
-            field = self._find_checkbox_by_value_or_context(fields, [key], ["strategy", "synthesis"])
+
+            field = self._find_strategy_field(fields, key)
             if field is None:
                 raise RuntimeError(f"Could not find the {key.upper()} strategy field on the live TridentSynth form.")
+
+            if field.name in used_field_names:
+                raise RuntimeError(
+                    f"Strategy resolution bug: {key.upper()} mapped to duplicate field {field.name!r}."
+                )
+
             self._append_multi(items, field.name, field.value or "on")
-            chosen[key] = field.value or "on"
+            chosen[key] = field.name
+            used_field_names.add(field.name)
+
         return chosen
 
     def _set_text_or_select(
@@ -398,7 +442,7 @@ class TridentSynth:
             response = session.post(url, data=items, timeout=120)
 
         if not response.ok:
-            payload_preview = {}
+            payload_preview: dict[str, Any] = {}
             for k, v in items:
                 if k in payload_preview:
                     if isinstance(payload_preview[k], list):
@@ -537,8 +581,9 @@ class TridentSynth:
 
     def _extract_summary_value(self, lines: list[str], label: str) -> Optional[str]:
         for idx, line in enumerate(lines):
-            if line.strip().lower() == label.lower() and idx + 1 < len(lines):
-                return lines[idx + 1]
+            if line.strip().lower() == label.lower():
+                if idx + 1 < len(lines):
+                    return lines[idx + 1]
         return None
 
     def _parse_results(self, soup: BeautifulSoup, url: str) -> dict[str, Any]:
@@ -697,10 +742,20 @@ class TridentSynth:
         strategy_fields = self._set_strategy_checkboxes(items, fields, use_pks, use_bio, use_chem)
 
         self._set_text_or_select(
-            items, fields, max_bio_steps, ["biological", "steps"], ["bio"], ["select", "number", "text"]
+            items,
+            fields,
+            max_bio_steps,
+            ["bio", "steps"],
+            ["#", "number"],
+            ["select", "number", "text"],
         )
         self._set_text_or_select(
-            items, fields, max_chem_steps, ["chemical", "steps"], ["chem"], ["select", "number", "text"]
+            items,
+            fields,
+            max_chem_steps,
+            ["chem", "steps"],
+            ["#", "number"],
+            ["select", "number", "text"],
         )
         self._set_text_or_select(
             items,
@@ -734,11 +789,30 @@ class TridentSynth:
                     ]
                 }
 
-        self._set_text_or_select(items, fields, max_carbon, ["carbon"], ["max", "atom"], ["select", "number", "text"])
         self._set_text_or_select(
-            items, fields, max_nitrogen, ["nitrogen"], ["max", "atom"], ["select", "number", "text"]
+            items,
+            fields,
+            max_carbon,
+            ["carbon"],
+            ["max", "atom"],
+            ["select", "number", "text"],
         )
-        self._set_text_or_select(items, fields, max_oxygen, ["oxygen"], ["max", "atom"], ["select", "number", "text"])
+        self._set_text_or_select(
+            items,
+            fields,
+            max_nitrogen,
+            ["nitrogen"],
+            ["max", "atom"],
+            ["select", "number", "text"],
+        )
+        self._set_text_or_select(
+            items,
+            fields,
+            max_oxygen,
+            ["oxygen"],
+            ["max", "atom"],
+            ["select", "number", "text"],
+        )
 
         submit_response = self._submit_form(session, base_soup, items)
         submit_response = self._handle_controlled_substance_warning(
