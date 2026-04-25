@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import time
 from typing import Any, Optional
@@ -15,7 +14,8 @@ class TridentSynth:
     Live TridentSynth runner.
 
     Submits a job to the public TridentSynth site, waits for completion, parses the
-    best pathway, and returns pathway structures as SMILES.
+    best pathway, and returns pathway structures, PKS modules, reaction rules, and
+    other result information as text/JSON.
     """
 
     def initiate(self) -> None:
@@ -198,7 +198,7 @@ class TridentSynth:
         if use_chem:
             payload.append(("synthesisStrategy_chem", "on"))
 
-        # These are the exact field names used by the live TridentSynth form.
+        # Exact live TridentSynth field names from browser Form Data.
         payload.append(("rangebio", str(max_bio_steps if max_bio_steps is not None else 1)))
         payload.append(("rangechem", str(max_chem_steps if max_chem_steps is not None else 1)))
 
@@ -306,40 +306,45 @@ class TridentSynth:
 
     def _candidate_result_urls(self, task_id: str) -> list[str]:
         return [
-            urljoin(self.base_url, f"{task_id}/"),
-            urljoin(self.base_url, f"{task_id}"),
             urljoin(self.base_url, f"results/{task_id}/"),
-            urljoin(self.base_url, f"results/{task_id}"),
-            urljoin(self.base_url, f"job/{task_id}/"),
-            urljoin(self.base_url, f"job/{task_id}"),
-            urljoin(self.base_url, f"status/{task_id}/"),
-            urljoin(self.base_url, f"status/{task_id}"),
-            urljoin(self.base_url, f"task/{task_id}/"),
-            urljoin(self.base_url, f"task/{task_id}"),
-            urljoin(self.base_url, f"?task_id={task_id}"),
         ]
 
-    def _fetch_result_page(self, session: requests.Session, task_id: str) -> tuple[Optional[str], Optional[str]]:
-        for url in self._candidate_result_urls(task_id):
-            try:
-                response = session.get(url, timeout=120)
-            except Exception:
-                continue
+    def _fetch_result_page(
+        self,
+        session: requests.Session,
+        task_id: str,
+        payload: list[tuple[str, str]],
+    ) -> tuple[Optional[str], Optional[str]]:
+        url = urljoin(self.base_url, f"results/{task_id}/")
 
-            if response.status_code != 200:
-                continue
+        try:
+            response = session.get(
+                url,
+                timeout=30,
+                headers={
+                    "Referer": self.base_url,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+            )
+        except Exception:
+            return None, None
 
-            text = response.text
-            if (
-                task_id in text
-                or "TridentSynth job summary" in text
-                or "Pathways to target found" in text
-                or "Job submitted. Please wait" in text
-                or "PKS product" in text
-                or "Post-PKS product" in text
-                or "Synthesis parameters" in text
-            ):
-                return url, text
+        if response.status_code != 200:
+            return None, None
+
+        text = response.text
+
+        if (
+            task_id in text
+            or "TridentSynth job summary" in text
+            or "Pathways to target found" in text
+            or "Job submitted. Please wait" in text
+            or "PKS product" in text
+            or "Post-PKS product" in text
+            or "Synthesis parameters" in text
+            or "Full pathway design" in text
+        ):
+            return url, text
 
         return None, None
 
@@ -377,6 +382,70 @@ class TridentSynth:
 
         return None
 
+    def _looks_like_smiles(self, value: str) -> bool:
+        if not value:
+            return False
+
+        value = value.strip("` ").strip()
+
+        if len(value) < 2:
+            return False
+
+        if value.lower() in {"i", "info", "none", "null", "nan"}:
+            return False
+
+        return bool(re.search(r"[CONFPSIBrcnos\[\]\(\)=#@+\-\\/0-9]", value))
+
+    def _unique_ordered(self, values: list[Optional[str]]) -> list[str]:
+        out: list[str] = []
+
+        for value in values:
+            if not value:
+                continue
+
+            value = value.strip("` ").strip()
+
+            if not self._looks_like_smiles(value):
+                continue
+
+            if value not in out:
+                out.append(value)
+
+        return out
+
+    def _extract_best_pathway_block(self, text: str) -> str:
+        patterns = [
+            r"Full pathway design #1(.*?)(Full pathway design #2|$)",
+            r"Pathway 1(.*?)(Pathway 2|$)",
+            r"Best pathway(.*?)(Full pathway design #2|Pathway 2|$)",
+            r"Top pathway(.*?)(Full pathway design #2|Pathway 2|$)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                return match.group(1)
+
+        return text
+
+    def _extract_product_smiles(self, text: str, label: str) -> Optional[str]:
+        pattern = rf"{re.escape(label)}.*?`([^`]+)`"
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            value = match.group(1).strip()
+            return value if self._looks_like_smiles(value) else None
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        label_clean = self._clean(label)
+
+        for i, line in enumerate(lines):
+            if self._clean(line).rstrip(":") == label_clean.rstrip(":"):
+                if i + 1 < len(lines):
+                    value = lines[i + 1].strip("` ")
+                    return value if self._looks_like_smiles(value) else None
+
+        return None
+
     def _extract_float_after_label(self, text: str, label: str) -> Optional[float]:
         pattern = rf"{re.escape(label)}.*?([0-9]+(?:\.[0-9]+)?)"
         match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
@@ -389,24 +458,29 @@ class TridentSynth:
             return None
 
     def _extract_reaction_smiles(self, text: str) -> list[str]:
-        candidates = re.findall(r"`([^`]*>>[^`]*)`", text)
         cleaned: list[str] = []
 
-        for item in candidates:
-            item = item.strip()
-            if item and item not in cleaned:
-                cleaned.append(item)
-
-        if cleaned:
-            return cleaned
-
-        loose = re.findall(
-            r"([A-Za-z0-9@\+\-\[\]\(\)=#$\\/%\.:]+>>[A-Za-z0-9@\+\-\[\]\(\)=#$\\/%\.:]+)",
+        section_match = re.search(
+            r"Reactions \(SMILES\)(.*?)(Reaction rules|Step feasibilities|Net feasibility|Full pathway design #2|Pathway 2|$)",
             text,
+            flags=re.IGNORECASE | re.DOTALL,
         )
-        for item in loose:
-            item = item.strip()
-            if item and item not in cleaned:
+
+        search_text = section_match.group(1) if section_match else text
+
+        candidates = re.findall(r"`([^`]*>>[^`]*)`", search_text)
+
+        if not candidates:
+            candidates = re.findall(
+                r"([A-Za-z0-9@\+\-\[\]\(\)=#$\\/%\.:]+>>[A-Za-z0-9@\+\-\[\]\(\)=#$\\/%\.:]+)",
+                search_text,
+            )
+
+        for item in candidates:
+            item = item.strip("` ").strip()
+            if ">>" not in item:
+                continue
+            if item not in cleaned:
                 cleaned.append(item)
 
         return cleaned
@@ -418,46 +492,124 @@ class TridentSynth:
         left, right = reaction_smiles.split(">>", 1)
 
         return {
-            "reactants": [s for s in left.split(".") if s],
-            "products": [s for s in right.split(".") if s],
+            "reactants": [s for s in left.split(".") if self._looks_like_smiles(s)],
+            "products": [s for s in right.split(".") if self._looks_like_smiles(s)],
         }
 
-    def _unique_ordered(self, values: list[Optional[str]]) -> list[str]:
-        out: list[str] = []
-        for value in values:
-            if not value:
-                continue
-            value = value.strip("` ")
-            if value and value not in out:
-                out.append(value)
-        return out
+    def _extract_pks_modules(self, text: str) -> list[dict[str, Any]]:
+        modules: list[dict[str, Any]] = []
 
-    def _extract_best_pathway_block(self, text: str) -> str:
+        # Only parse before downstream post-PKS pathway sections.
+        pre_pathway_text = re.split(
+            r"Post-PKS pathways|Pathway 1|Reaction rules|Reaction enthalpies",
+            text,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+
+        pattern = re.compile(
+            r"MODULE\s+(\d+)\s+\((.*?)\)(.*?)(?=MODULE\s+\d+\s+\(|Domain legend|Post-PKS pathways|$)",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        seen_module_numbers: set[int] = set()
+
+        for match in pattern.finditer(pre_pathway_text):
+            module_number = int(match.group(1))
+
+            # If Module 1, 2, etc. appears again, the page has moved to another candidate design.
+            # Stop so we only return the first/best PKS module set.
+            if module_number in seen_module_numbers:
+                break
+
+            seen_module_numbers.add(module_number)
+
+            module_type = re.sub(r"\s+", " ", match.group(2)).strip()
+            module_body = match.group(3)
+
+            domains: list[dict[str, Optional[str]]] = []
+
+            domain_candidates = re.findall(
+                r"\b(KSq|KS|AT|KR|DH|ER|ACP)\b(?:\s*\(substrate:\s*([^)]+)\))?",
+                module_body,
+                flags=re.IGNORECASE,
+            )
+
+            for domain, substrate in domain_candidates:
+                canonical_domain = "KSq" if domain.lower() == "ksq" else domain.upper()
+                clean_substrate = substrate.strip() if substrate else None
+
+                domains.append(
+                    {
+                        "domain": canonical_domain,
+                        "substrate": clean_substrate,
+                    }
+                )
+
+            domain_text_parts = []
+            for item in domains:
+                if item["substrate"]:
+                    domain_text_parts.append(f"{item['domain']} substrate {item['substrate']}")
+                else:
+                    domain_text_parts.append(str(item["domain"]))
+
+            modules.append(
+                {
+                    "module_number": module_number,
+                    "module_type": module_type,
+                    "domains": domains,
+                    "text_summary": f"Module {module_number} ({module_type}): " + ", ".join(domain_text_parts),
+                }
+            )
+
+        return modules
+
+    def _extract_domain_legend(self, text: str) -> Optional[str]:
         match = re.search(
-            r"Full pathway design #1(.*?)(Full pathway design #2|$)",
+            r"Domain legend\s*(.*?)(Post-PKS pathways|Pathway 1|$)",
             text,
             flags=re.IGNORECASE | re.DOTALL,
         )
-        if match:
-            return match.group(1)
+        if not match:
+            return None
 
-        return text
+        legend = re.sub(r"\s+", " ", match.group(1)).strip()
+        return legend or None
 
-    def _extract_product_smiles(self, text: str, label: str) -> Optional[str]:
-        pattern = rf"{re.escape(label)}.*?`([^`]+)`"
-        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            return match.group(1).strip()
+    def _extract_reaction_rule_names(self, text: str) -> list[str]:
+        match = re.search(
+            r"Reaction rules\s*(.*?)(Reaction enthalpies|Step feasibilities|Net feasibility|Full pathway design #2|Pathway 2|$)",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return []
 
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        label_clean = self._clean(label)
+        section = match.group(1)
+        lines = [line.strip() for line in section.splitlines() if line.strip()]
 
-        for i, line in enumerate(lines):
-            if self._clean(line).rstrip(":") == label_clean.rstrip(":"):
-                if i + 1 < len(lines):
-                    return lines[i + 1].strip("` ")
+        cleaned: list[str] = []
+        for line in lines:
+            if line.lower() in {"reaction rules", "none"}:
+                continue
+            if line not in cleaned:
+                cleaned.append(line)
 
-        return None
+        return cleaned
+
+    def _extract_reaction_enthalpies(self, text: str) -> list[str]:
+        match = re.search(
+            r"Reaction enthalpies\s*\(kcal/mol\)\s*(.*?)(Step feasibilities|Net feasibility|Full pathway design #2|Pathway 2|$)",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return []
+
+        section = match.group(1)
+        enthalpies = re.findall(r"-?\d+(?:\.\d+)?\s*kcal/mol", section)
+
+        return list(dict.fromkeys(enthalpies))
 
     def _parse_result_page(self, html: str, task_id: Optional[str]) -> dict[str, Any]:
         soup = BeautifulSoup(html, "html.parser")
@@ -490,9 +642,20 @@ class TridentSynth:
         net_feasibility = self._extract_float_after_label(best_block, "Net feasibility")
 
         reaction_smiles = self._extract_reaction_smiles(best_block)
+
+        # Fallback safety: for pages where pathway sections are not clearly separated,
+        # only keep the first/top reaction so alternative reactions do not flood output.
+        if len(reaction_smiles) > 1:
+            reaction_smiles = reaction_smiles[:1]
+
         reaction_structures = [self._reaction_to_structures(rxn) for rxn in reaction_smiles]
 
-        reaction_rules = self._unique_ordered(re.findall(r"rule\d+_\d+", best_block))
+        reaction_rule_ids = self._unique_ordered(re.findall(r"rule\d+_\d+", best_block))
+        reaction_rule_names = self._extract_reaction_rule_names(best_block)
+        reaction_enthalpies = self._extract_reaction_enthalpies(best_block)
+
+        pks_modules = self._extract_pks_modules(full_text)
+        domain_legend = self._extract_domain_legend(full_text)
 
         step_feasibilities: list[float] = []
         step_section = re.search(
@@ -542,6 +705,8 @@ class TridentSynth:
                 "bio_steps": bio_steps,
                 "chem_steps": chem_steps,
             },
+            "pks_modules": pks_modules,
+            "domain_legend": domain_legend,
             "best_pathway": {
                 "pks_product_smiles": pks_product,
                 "pks_similarity_to_target": pks_similarity,
@@ -550,11 +715,23 @@ class TridentSynth:
                 "net_feasibility": net_feasibility,
                 "reaction_smiles": reaction_smiles,
                 "reaction_structures": reaction_structures,
-                "reaction_rules": reaction_rules,
+                "reaction_rule_ids": reaction_rule_ids,
+                "reaction_rule_names": reaction_rule_names,
+                "reaction_enthalpies": reaction_enthalpies,
                 "step_feasibilities": step_feasibilities,
                 "pathway_structures_smiles": pathway_structures_smiles,
             },
         }
+
+    def _add_selected_steps(self, parsed: dict[str, Any], submitted_query: dict[str, Any]) -> dict[str, Any]:
+        params = parsed.get("synthesis_parameters", {})
+
+        parsed["selected_steps"] = {
+            "bio_steps": params.get("bio_steps") if submitted_query.get("use_bio") else None,
+            "chem_steps": params.get("chem_steps") if submitted_query.get("use_chem") else None,
+        }
+
+        return parsed
 
     def run(
         self,
@@ -573,7 +750,7 @@ class TridentSynth:
         auto_optimize_unspecified: bool = True,
         wait_for_completion: bool = True,
         timeout_seconds: int = 600,
-        poll_seconds: int = 15,
+        poll_seconds: int = 5,
         acknowledge_controlled_substance_warning: bool = False,
     ) -> dict[str, Any]:
         session = self._session()
@@ -604,7 +781,10 @@ class TridentSynth:
 
         if not task_id:
             if self._is_result_complete(submit_response.text):
-                parsed = self._parse_result_page(submit_response.text, task_id=None)
+                parsed = self._add_selected_steps(
+                    self._parse_result_page(submit_response.text, task_id=None),
+                    normalized_query,
+                )
                 return {
                     "ok": True,
                     "status": "completed",
@@ -631,13 +811,16 @@ class TridentSynth:
         last_html: Optional[str] = None
 
         while time.time() <= deadline:
-            result_url, result_html = self._fetch_result_page(session, task_id)
+            result_url, result_html = self._fetch_result_page(session, task_id, payload)
 
             if result_html:
                 last_html = result_html
 
                 if self._is_result_complete(result_html):
-                    parsed = self._parse_result_page(result_html, task_id=task_id)
+                    parsed = self._add_selected_steps(
+                        self._parse_result_page(result_html, task_id=task_id),
+                        normalized_query,
+                    )
                     return {
                         "ok": True,
                         "status": "completed",
@@ -650,7 +833,10 @@ class TridentSynth:
 
         timed_out_result = None
         if last_html:
-            timed_out_result = self._parse_result_page(last_html, task_id=task_id)
+            timed_out_result = self._add_selected_steps(
+                self._parse_result_page(last_html, task_id=task_id),
+                normalized_query,
+            )
 
         return {
             "ok": False,
