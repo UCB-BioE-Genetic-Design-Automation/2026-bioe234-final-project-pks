@@ -78,3 +78,9 @@ A RetroTide design is a blueprint — it tells you what each module should do (e
 **Input:** Whether the module is a loading module (true/false), the AT substrate name (e.g., "Malonyl-CoA"), and which reductive domains are active (e.g., "KR,DH,ER"). Called once per module in the design.
 
 **Output:** A list of matching natural PKS modules from ClusterCAD, each with cluster accession, subunit name, and amino acid sequences for all domains.
+
+---
+
+## Individual Contribution Scope
+
+Over the course of this project, I built the four tools described above, their JSON descriptors, and a 500-line test suite (`test_tools_JGK.py`, 54 offline + 11 network tests). I started by integrating RetroTide and adding `resolve_smiles` as a PubChem-backed input layer, then wrote `assess_pks_feasibility` as a novel pre-screening step with seven weighted checks. I added `match_design_to_parts` to bridge computational designs to real ClusterCAD sequences, and later refactored it into the simpler `find_pks_module_parts` interface (scalar arguments instead of a nested dict) to fix a Gemini client crash caused by the original tool's complex input schema. I also contributed sections 7–10 of THEORY.md, prompt test entries in `prompts.json`, and SKILL.md updates documenting each tool and the overall pipeline workflow. In addition to all of these, I of course tested client_gemini.py with different PKS products (heptane, hexane, adipic acid, and others) to make sure the user-end experience worked well.
